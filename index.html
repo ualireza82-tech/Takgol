@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="fa">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+<title>AJ SPORTS LIVE</title>
+<style>
+body{margin:0;background:#000;display:flex;justify-content:center;align-items:center;height:100vh;overflow:hidden;font-family:Arial,sans-serif;touch-action:pan-x pan-y;overscroll-behavior:none}
+.stadium-frame{position:relative;width:100%;height:100%;background:radial-gradient(circle at center,#003300 0%,#000 80%);display:flex;justify-content:center;align-items:center;overflow:hidden}
+.line{position:absolute;border:1px solid rgba(255,255,255,0.05);border-radius:50%;z-index:1}
+.line.circle{width:150px;height:150px;top:50%;left:50%;transform:translate(-50%,-50%);animation:none}
+.line.box{width:80%;height:80%;top:10%;left:10%;border:none;}
+.video-container{position:relative;width:100vw;height:auto;max-height:100vh;z-index:2}
+video{width:100%;height:auto;display:block;transition:opacity 0.4s ease,transform 0.3s ease;object-fit:cover}
+#video{opacity:0}
+.logo-text-container{position:absolute;top:5%;right:4.5%;display:flex;flex-direction:column;align-items:center;z-index:10;transform-origin:top right;transition:transform 0.3s ease}
+.logo-text{display:flex;align-items:center;font-weight:bold;font-size:2vw;overflow:hidden}
+.blue-part{background:#0026FF;color:#fff;padding:0.6vw 1vw}
+.red-part{background:#FF0000;color:#fff;padding:0.6vw 1vw}
+.live-badge{width:100%;background:#B80000;color:#fff;font-weight:bold;font-size:1vw;text-align:center;padding:0.25vw 0;border-radius:0 0 0.3vw 0.3vw;margin-top:0}
+.news-ticker{position:absolute;bottom:0;width:100%;background:#c00;color:#fff;font-size:1vw;font-weight:bold;height:2em;display:flex;align-items:center;justify-content:center;overflow:hidden;z-index:20}
+.news-label{background:#007BFF;color:#fff;padding:0 0.5em;height:100%;display:flex;align-items:center;flex-shrink:0;position:absolute;left:0}
+.news-item{position:absolute;opacity:0;transform:translateY(-50%);transition:all 0.4s ease;white-space:nowrap;height:2em;display:flex;align-items:center;justify-content:center;width:100%}
+.news-item.active{opacity:1;transform:translateY(0)}
+.controls-bar{position:absolute;bottom:6px;right:6px;display:flex;gap:3px;z-index:30}
+.control-btn{background:rgba(0,0,0,0.5);color:#fff;border:none;border-radius:2px;padding:2px 3px;font-size:5.5px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background 0.25s ease}
+.control-btn:hover{background:rgba(255,255,255,0.25)}
+.quality-menu{position:absolute;bottom:14px;right:0;background:rgba(0,0,0,0.85);border-radius:2px;display:none;flex-direction:column}
+.quality-menu button{background:none;border:none;color:#fff;padding:2px 4px;font-size:5.5px;cursor:pointer;text-align:left}
+.quality-menu button:hover{background:rgba(255,255,255,0.2)}
+</style>
+</head>
+<body>
+<div class="stadium-frame">
+  <div class="line circle"></div>
+  <div class="line box"></div>
+  <div class="video-container">
+    <video id="preview-video" autoplay muted playsinline loop style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;z-index:1;opacity:1">
+      <source src="https://dl24.mp4.ir/video/2025/9/323769-365590869/323769-365590869-480.mp4" type="video/mp4">
+    </video>
+    <video id="video" autoplay muted playsinline preload="auto"></video>
+    <div class="logo-text-container">
+      <div class="logo-text"><span class="blue-part">AJ</span><span class="red-part">SPORTS</span></div>
+      <div class="live-badge" id="live-badge">LIVE</div>
+    </div>
+    <div class="news-ticker">
+      <div class="news-label">اخبار ورزشی</div>
+      <div class="news-item active" id="news-item"></div>
+    </div>
+    <div class="controls-bar">
+      <button class="control-btn" id="mute-btn">🔇</button>
+      <div style="position:relative">
+        <button class="control-btn" id="quality-btn">Auto</button>
+        <div class="quality-menu" id="quality-menu"></div>
+      </div>
+      <button class="control-btn" id="fs-btn">⛶</button>
+    </div>
+  </div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<script>
+const preview=document.getElementById('preview-video'),
+      video=document.getElementById('video');
+
+const videoSrc="https://vod.splay.uz/live_splay/original/Setanta1HD/playlist.m3u8";
+let hls;
+const qualityBtn=document.getElementById('quality-btn');
+
+if(Hls.isSupported()){ 
+    hls = new Hls({
+        enableWorker:true,
+        lowLatencyMode:false
+    });
+    hls.loadSource(videoSrc);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED,(e,data)=>{
+        const qMenu=document.getElementById('quality-menu');
+        qMenu.innerHTML='';
+        const autoBtn=document.createElement('button');
+        autoBtn.textContent='Auto';
+        autoBtn.onclick=()=>{hls.currentLevel=-1; qualityBtn.textContent='Auto'; qMenu.style.display='none';};
+        qMenu.appendChild(autoBtn);
+        data.levels.forEach((level,i)=>{
+            const b=document.createElement('button');
+            b.textContent=level.height+'p';
+            b.onclick=()=>{hls.currentLevel=i; qualityBtn.textContent=b.textContent; qMenu.style.display='none';};
+            qMenu.appendChild(b);
+        });
+    });
+} else if(video.canPlayType('application/vnd.apple.mpegurl')){
+    video.src=videoSrc;
+}
+
+// وقتی تصویر لود شد → نمایش و پخش
+video.addEventListener("loadeddata",()=>{
+    video.style.opacity=1;
+    preview.style.transition='opacity 0.5s ease';
+    preview.style.opacity=0;
+    setTimeout(()=>{preview.style.display='none';},500);
+    video.play().catch(()=>{});
+});
+
+// 🔴 Badge: cycle
+const liveBadge=document.getElementById('live-badge'); 
+function cycleBadge(){ 
+    liveBadge.innerText='پخش زنده'; 
+    setTimeout(()=>{liveBadge.innerText='LIVE'},5601000); 
+    setTimeout(cycleBadge,6601000); 
+} 
+cycleBadge();
+
+// News ticker
+const newsItem=document.getElementById('news-item'); 
+const newsArr=["گل مهم در لیگ برتر انگلیس","نتایج هفته گذشته لیگ قهرمانان اروپا","تغییرات جدول رده‌بندی فوتبال ایران","مصاحبه با سرمربی تیم ملی"]; 
+function showNews(){ 
+    newsItem.textContent=newsArr[Math.floor(Math.random()*newsArr.length)]; 
+} 
+showNews(); 
+setInterval(showNews,30000);
+
+// Mute / Unmute
+const muteBtn=document.getElementById('mute-btn'); 
+video.muted=true; 
+muteBtn.textContent='🔇'; 
+muteBtn.onclick=()=>{video.muted=!video.muted; muteBtn.textContent=video.muted?'🔇':'🔊';};
+
+// Quality menu toggle
+const qualityMenu=document.getElementById('quality-menu'); 
+qualityBtn.onclick=()=>{qualityMenu.style.display = qualityMenu.style.display==='flex'?'none':'flex';};
+
+// Auto play on first click / touch (برای مرورگرهایی که محدودیت دارند)
+document.body.addEventListener('click',()=>{video.play().catch(()=>{});},{once:true}); 
+document.body.addEventListener('touchstart',()=>{video.play().catch(()=>{});},{once:true});
+
+// Lock landscape orientation
+function lockLandscape(){if(screen.orientation && screen.orientation.lock){screen.orientation.lock('landscape-primary').catch(()=>{});}} 
+lockLandscape(); 
+window.addEventListener('orientationchange',lockLandscape); 
+window.addEventListener('resize',lockLandscape); 
+
+// Fullscreen button
+const fsBtn=document.getElementById('fs-btn');
+const videoContainer=document.querySelector('.video-container');
+fsBtn.onclick=async()=>{
+  if(!document.fullscreenElement){
+    await videoContainer.requestFullscreen();
+    try{await screen.orientation.lock("portrait-primary");}catch(e){console.warn(e);}
+  } else {
+    await document.exitFullscreen();
+    try{await screen.orientation.lock("landscape-primary");}catch(e){console.warn(e);}
+  }
+};
+</script>
+</body>
+</html>
