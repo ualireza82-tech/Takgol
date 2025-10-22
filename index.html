@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>چت زنده هواداران — AJSports</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>چت زنده هواداران — AJSports</h1>
+    <p class="muted">آزمایشی — پیام‌ها در حافظهٔ سرور نگهداری می‌شوند</p>
+  </header>
+
+  <main>
+    <aside class="chat-panel">
+      <div id="messages" class="messages"></div>
+
+      <div class="composer">
+        <input id="username" placeholder="نام شما (مثلاً Ali)" maxlength="30" />
+        <input id="text" placeholder="پیام خود را بنویسید..." maxlength="500" />
+        <button id="sendBtn">ارسال</button>
+      </div>
+    </aside>
+  </main>
+
+<script>
+  const proto = (location.protocol === 'https:') ? 'wss' : 'ws';
+  const wsUrl = proto + '://' + location.host;
+  const ws = new WebSocket(wsUrl);
+
+  const messagesEl = document.getElementById('messages');
+  const userInput = document.getElementById('username');
+  const textInput = document.getElementById('text');
+  const sendBtn = document.getElementById('sendBtn');
+
+  function addMessage(m){
+    const el = document.createElement('div');
+    el.className = 'message';
+    el.innerHTML = `<div class="m-meta"><strong>${escapeHtml(m.user)}</strong> <span class="time">${new Date(m.ts).toLocaleTimeString()}</span></div>
+                    <div class="m-text">${escapeHtml(m.text)}</div>`;
+    messagesEl.appendChild(el);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  function escapeHtml(s){
+    return s.replace(/[&<>"']/g, (c)=> ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;"}[c]));
+  }
+
+  ws.addEventListener('message', (ev) => {
+    try {
+      const data = JSON.parse(ev.data);
+      if(data.type === 'init' && Array.isArray(data.messages)){
+        messagesEl.innerHTML = '';
+        data.messages.forEach(m => addMessage(m));
+      } else if(data.type === 'message' && data.message){
+        addMessage(data.message);
+      }
+    } catch (e) {
+      console.error('invalid ws msg', e);
+    }
+  });
+
+  sendBtn.addEventListener('click', sendMessage);
+  textInput.addEventListener('keydown', (e)=> { if(e.key === 'Enter') sendMessage(); });
+
+  function sendMessage(){
+    const name = (userInput.value || 'میهمان').trim();
+    const text = (textInput.value || '').trim();
+    if(!text) return;
+    const payload = { user: name, text };
+    ws.send(JSON.stringify(payload));
+    textInput.value = '';
+    textInput.focus();
+  }
+</script>
+</body>
+</html>
