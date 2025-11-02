@@ -1,6 +1,0 @@
-{
-  "name": "vercel-sse-chat",
-  "version": "1.0.0",
-  "main": "api/chat.js",
-  "type": "module"
-}
