@@ -1,7 +1,0 @@
-{
-  "name": "vercel-realtime-chat",
-  "version": "1.0.0",
-  "main": "api/chat.js",
-  "type": "module",
-  "dependencies": {}
-}
