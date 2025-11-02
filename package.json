@@ -1,9 +1,0 @@
-{
-  "name": "chat-server",
-  "version": "1.0.0",
-  "type": "module",
-  "dependencies": {
-    "express": "^4.19.2",
-    "ws": "^8.15.0"
-  }
-}
