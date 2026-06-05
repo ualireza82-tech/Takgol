@@ -230,14 +230,18 @@ async function registerBotAccounts() {
 }
 
 /** Post a tweet as a bot account. Returns tweet ID or null. */
+// ✅ دیگه به Main API نمی‌فرستیم — فقط در Bot DB ذخیره میکنیم
 async function postTweet(username, content, mediaUrl) {
   try {
-    const body = { username, content };
-    if (mediaUrl) body.media_url = mediaUrl;
-    const data = await apiPost('/api/tweets', body);
-    if (data.success && data.tweet?.id) return data.tweet.id;
-    console.warn(`  ⚠️  postTweet failed [${username}]:`, JSON.stringify(data).substring(0, 100));
-    return null;
+    const result = await pool.query(
+      `INSERT INTO rss_news_tweets 
+       (username, content, media_url, created_at)
+       VALUES ($1, $2, $3, NOW())
+       RETURNING id`,
+      [username, content, mediaUrl || null]
+    );
+    const tweetId = result.rows[0]?.id;
+    return tweetId;
   } catch (err) {
     console.error(`  ❌ postTweet error:`, err.message);
     return null;
@@ -268,6 +272,17 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_pi_posted_at    ON posted_items (posted_at);
     CREATE INDEX IF NOT EXISTS idx_pi_bot_username ON posted_items (bot_username);
     CREATE INDEX IF NOT EXISTS idx_pi_guid_bot     ON posted_items (guid, bot_username);
+
+    CREATE TABLE IF NOT EXISTS rss_news_tweets (
+      id           SERIAL PRIMARY KEY,
+      username     TEXT        NOT NULL,
+      content      TEXT        NOT NULL,
+      media_url    TEXT,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_rss_created_at ON rss_news_tweets (created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_rss_username   ON rss_news_tweets (username);
   `);
   console.log('✅ Bot DB ready');
 }
@@ -350,22 +365,7 @@ async function runAllFeeds() {
 // CLEANUP: Delete expired tweets from main DB
 // ============================================================
 
-async function cleanupExpiredTweets() {
-  const cutoff = new Date(Date.now() - NEWS_TTL_MIN * 60 * 1000);
 
-  let expired;
-  try {
-    const r = await pool.query(
-      `SELECT tweet_id, bot_username
-       FROM posted_items
-       WHERE posted_at < $1 AND tweet_id IS NOT NULL`,
-      [cutoff]
-    );
-    expired = r.rows;
-  } catch (err) {
-    console.error('❌ Cleanup query error:', err.message);
-    return;
-  }
 
   if (expired.length === 0) return;
 
@@ -443,6 +443,55 @@ app.post('/trigger/cleanup', async (req, res) => {
   if (auth !== BOT_SECRET) return res.status(403).json({ error: 'forbidden' });
   cleanupExpiredTweets().catch(console.error);
   res.json({ message: 'cleanup triggered' });
+});
+app.get('/api/news', async (req, res) => {
+  const limit  = Math.min(parseInt(req.query.limit  || '30'), 100);
+  const offset = parseInt(req.query.offset || '0');
+  const lang   = req.query.lang || null;
+
+  try {
+    let whereClause = `WHERE t.created_at > NOW() - INTERVAL '${NEWS_TTL_MIN} minutes'`;
+    const params = [limit, offset];
+
+    if (lang) {
+      const usernames = BOT_ACCOUNTS
+        .filter(b => b.lang === lang)
+        .map(b => b.username);
+      if (usernames.length === 0) {
+        return res.json({ success: true, news: [], total: 0 });
+      }
+      const placeholders = usernames.map((_, i) => `$${i + 3}`).join(',');
+      whereClause += ` AND t.username IN (${placeholders})`;
+      params.push(...usernames);
+    }
+
+    const r = await pool.query(
+      `SELECT t.id, t.username, t.content, t.media_url, t.created_at
+       FROM rss_news_tweets t
+       ${whereClause}
+       ORDER BY t.created_at DESC
+       LIMIT $1 OFFSET $2`,
+      params
+    );
+
+    // اضافه کردن اطلاعات بات به هر توییت
+    const botMap = {};
+    BOT_ACCOUNTS.forEach(b => {
+      botMap[b.username] = { display_name: b.display_name, avatar_url: b.avatar_url, lang: b.lang };
+    });
+
+    const news = r.rows.map(row => ({
+      ...row,
+      display_name: botMap[row.username]?.display_name || row.username,
+      avatar_url:   botMap[row.username]?.avatar_url   || null,
+      lang:         botMap[row.username]?.lang          || 'fa',
+    }));
+
+    res.json({ success: true, news, total: news.length });
+  } catch (err) {
+    console.error('❌ /api/news error:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 // ============================================================
