@@ -361,26 +361,7 @@ async function runAllFeeds() {
   console.log(`✅ Cycle done — ${totalPosted} new tweets — ${Date.now() - start}ms\n`);
 }
 
-// ============================================================
-// CLEANUP: Delete expired tweets from main DB
-// ============================================================
 
-
-
-  if (expired.length === 0) return;
-
-  console.log(`🧹 Cleaning ${expired.length} expired news tweets...`);
-
-  for (const row of expired) {
-    await deleteTweet(row.tweet_id, row.bot_username);
-    await new Promise(r => setTimeout(r, 200));
-  }
-
-  // Remove from tracking DB
-  await pool.query('DELETE FROM posted_items WHERE posted_at < $1', [cutoff]);
-
-  console.log(`🧹 Done — ${expired.length} tweets deleted from main DB`);
-}
 
 // ============================================================
 // CRON SCHEDULES
