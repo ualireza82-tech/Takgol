@@ -1,14 +1,14 @@
-/**
+ /**
  * AJ Sports 2026 - RSS News Bot Service
  * Version: 1.0.0
  * Deploy: Render (separate Web Service)
  *
  * Architecture:
- *   - Fetches RSS every 3 minutes
- *   - Posts as bot user accounts to main API
- *   - Auto-deletes tweets older than NEWS_TTL_MINUTES (default: 60)
- *   - Uses own Neon DB only for dedup tracking
- *   - Zero changes required to main backend or frontend
+ * - Fetches RSS every 3 minutes
+ * - Posts as bot user accounts to main API
+ * - Auto-deletes tweets older than NEWS_TTL_MINUTES (default: 60)
+ * - Uses own Neon DB only for dedup tracking
+ * - Zero changes required to main backend or frontend
  */
 
 require('dotenv').config();
@@ -121,7 +121,6 @@ const rssParser = new Parser({
 
 /** Extract best available image URL from an RSS item */
 function extractImage(item) {
-  // media:content
   if (item.mediaContent) {
     if (typeof item.mediaContent === 'object') {
       const url = item.mediaContent?.$ ?.url || item.mediaContent?.url;
@@ -129,13 +128,11 @@ function extractImage(item) {
     }
   }
 
-  // media:thumbnail
   if (item.mediaThumbnail) {
     const url = item.mediaThumbnail?.$ ?.url || item.mediaThumbnail?.url;
     if (url) return url;
   }
 
-  // enclosure (podcast/image)
   if (item.enclosure?.url) {
     const t = (item.enclosure.type || '');
     if (t.startsWith('image/') || item.enclosure.url.match(/\.(jpg|jpeg|png|webp|gif)/i)) {
@@ -143,7 +140,6 @@ function extractImage(item) {
     }
   }
 
-  // Scan description / content HTML for <img>
   const html = item['content:encoded'] || item.content || item.description || '';
   if (html) {
     const m = html.match(/<img[^>]+src=["']([^"']+)["']/i);
@@ -230,7 +226,6 @@ async function registerBotAccounts() {
 }
 
 /** Post a tweet as a bot account. Returns tweet ID or null. */
-// ✅ دیگه به Main API نمی‌فرستیم — فقط در Bot DB ذخیره میکنیم
 async function postTweet(username, content, mediaUrl) {
   try {
     const result = await pool.query(
@@ -240,8 +235,7 @@ async function postTweet(username, content, mediaUrl) {
        RETURNING id`,
       [username, content, mediaUrl || null]
     );
-    const tweetId = result.rows[0]?.id;
-    return tweetId;
+    return result.rows[0]?.id || null;
   } catch (err) {
     console.error(`  ❌ postTweet error:`, err.message);
     return null;
@@ -361,7 +355,42 @@ async function runAllFeeds() {
   console.log(`✅ Cycle done — ${totalPosted} new tweets — ${Date.now() - start}ms\n`);
 }
 
+// ============================================================
+// CLEANUP: Delete expired tweets from main DB
+// ============================================================
 
+async function cleanupExpiredTweets() {
+  const cutoff = new Date(Date.now() - NEWS_TTL_MIN * 60 * 1000);
+
+  let expired;
+  try {
+    const r = await pool.query(
+      `SELECT tweet_id, bot_username
+       FROM posted_items
+       WHERE posted_at < $1 AND tweet_id IS NOT NULL`,
+      [cutoff]
+    );
+    expired = r.rows;
+  } catch (err) {
+    console.error('❌ Cleanup query error:', err.message);
+    return;
+  }
+
+  if (expired.length === 0) return;
+
+  console.log(`🧹 Cleaning ${expired.length} expired news tweets...`);
+
+  for (const row of expired) {
+    await deleteTweet(row.tweet_id, row.bot_username);
+    await new Promise(r => setTimeout(r, 200));
+  }
+
+  // Remove expired from tracking table & news cache table
+  await pool.query('DELETE FROM posted_items WHERE posted_at < $1', [cutoff]);
+  await pool.query('DELETE FROM rss_news_tweets WHERE created_at < $1', [cutoff]);
+
+  console.log(`🧹 Done — ${expired.length} tweets deleted from main DB and Cache`);
+}
 
 // ============================================================
 // CRON SCHEDULES
@@ -411,7 +440,7 @@ app.get('/health', async (req, res) => {
   }
 });
 
-// Manual trigger endpoint (protect with secret)
+// Manual trigger endpoints
 app.post('/trigger/fetch', async (req, res) => {
   const auth = req.headers['x-bot-secret'];
   if (auth !== BOT_SECRET) return res.status(403).json({ error: 'forbidden' });
@@ -425,6 +454,8 @@ app.post('/trigger/cleanup', async (req, res) => {
   cleanupExpiredTweets().catch(console.error);
   res.json({ message: 'cleanup triggered' });
 });
+
+// GET /api/news Endpoint
 app.get('/api/news', async (req, res) => {
   const limit  = Math.min(parseInt(req.query.limit  || '30'), 100);
   const offset = parseInt(req.query.offset || '0');
@@ -455,7 +486,6 @@ app.get('/api/news', async (req, res) => {
       params
     );
 
-    // اضافه کردن اطلاعات بات به هر توییت
     const botMap = {};
     BOT_ACCOUNTS.forEach(b => {
       botMap[b.username] = { display_name: b.display_name, avatar_url: b.avatar_url, lang: b.lang };
@@ -497,7 +527,6 @@ async function start() {
       console.log(`\n🚀 Bot server running on port ${PORT}`);
     });
 
-    // Initial fetch after 10s startup delay
     setTimeout(runAllFeeds, 10000);
 
   } catch (err) {
