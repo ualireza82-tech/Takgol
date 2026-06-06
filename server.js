@@ -4,6 +4,7 @@
  * ✅ RSS → فقط bot_news در Bot DB ذخیره می‌شود
  * ✅ GET /api/news → فرانت‌اند مستقیم می‌خواند
  * ❌ هیچ تماسی با بک‌اند اصلی یا DB اصلی وجود ندارد
+ * ✅ دارای سیستم ایزوله لایک و کامنت با حذف خودکار (Cascade)
  */
 
 require('dotenv').config();
@@ -30,9 +31,9 @@ if (!BOT_DB_URL) {
 }
 
 // ═══════════════════════════════════════════
-// CORS — فرانت‌اند از هر origin بتواند GET بزند
+// CORS — فرانت‌اند از هر origin بتواند درخواست بزند
 // ═══════════════════════════════════════════
-app.use(cors({ origin: '*', methods: ['GET'] }));
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE'] }));
 app.use(express.json());
 
 // ═══════════════════════════════════════════
@@ -135,10 +136,11 @@ function itemGuid(item) {
 }
 
 // ═══════════════════════════════════════════
-// DB INIT — فقط یک جدول در Bot DB
+// DB INIT — اعمال دقیق ساختار دیتابیس همراه با جداول جدید
 // ═══════════════════════════════════════════
 async function initDB() {
   await pool.query(`
+    -- 1. جدول اصلی اخبار
     CREATE TABLE IF NOT EXISTS bot_news (
       id           SERIAL      PRIMARY KEY,
       guid         TEXT        UNIQUE NOT NULL,
@@ -155,8 +157,31 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_bn_created ON bot_news (created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_bn_lang    ON bot_news (lang);
     CREATE INDEX IF NOT EXISTS idx_bn_bot     ON bot_news (bot_name);
+
+    -- 2. جدول لایک‌ها (متصل به جدول اصلی با ON DELETE CASCADE)
+    CREATE TABLE IF NOT EXISTS news_likes (
+      id         SERIAL      PRIMARY KEY,
+      news_id    INT         NOT NULL REFERENCES bot_news(id) ON DELETE CASCADE,
+      username   TEXT        NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(news_id, username)
+    );
+    CREATE INDEX IF NOT EXISTS idx_nl_news_id ON news_likes (news_id);
+
+    -- 3. جدول کامنت‌ها (متصل به جدول اصلی با ON DELETE CASCADE)
+    CREATE TABLE IF NOT EXISTS news_comments (
+      id           SERIAL      PRIMARY KEY,
+      news_id      INT         NOT NULL REFERENCES bot_news(id) ON DELETE CASCADE,
+      username     TEXT        NOT NULL,
+      display_name TEXT,
+      avatar_url   TEXT,
+      content      TEXT        NOT NULL,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_nc_news_id ON news_comments (news_id);
+    CREATE INDEX IF NOT EXISTS idx_nc_created ON news_comments (created_at ASC);
   `);
-  console.log('✅ bot_news table ready in Bot DB');
+  console.log('✅ Tables ready in Bot DB: bot_news, news_likes, news_comments');
 }
 
 // ═══════════════════════════════════════════
@@ -228,7 +253,7 @@ async function runAllFeeds() {
 }
 
 // ═══════════════════════════════════════════
-// AUTO CLEANUP — فقط از Bot DB پاک می‌کند
+// AUTO CLEANUP — به لطف CASCADE، لایک و کامنت‌های اخبار قدیمی هم خودکار پاک می‌شوند
 // ═══════════════════════════════════════════
 async function cleanup() {
   const cutoff = new Date(Date.now() - NEWS_TTL_MIN * 60 * 1000);
@@ -237,7 +262,7 @@ async function cleanup() {
     [cutoff]
   );
   if (r.rows.length > 0)
-    console.log(`🧹 Cleaned ${r.rows.length} old news (TTL: ${NEWS_TTL_MIN}min)`);
+    console.log(`🧹 Cleaned ${r.rows.length} old news (TTL: ${NEWS_TTL_MIN}min) + their likes/comments`);
 }
 
 // ═══════════════════════════════════════════
@@ -253,7 +278,6 @@ cron.schedule('*/10 * * * *',          cleanup);
 /**
  * GET /api/news
  * query: lang=fa|en  bot=khabar_varzeshi  limit=50
- * فرانت‌اند مستقیم از اینجا می‌خواند — هیچ ربطی به بک‌اند اصلی ندارد
  */
 app.get('/api/news', async (req, res) => {
   try {
@@ -287,6 +311,98 @@ app.get('/api/news', async (req, res) => {
   }
 });
 
+// ── لایک خبر ─────────────────────────────────────────────────────
+app.post('/api/news/:newsId/like', async (req, res) => {
+  const { newsId } = req.params;
+  const { username } = req.body;
+  if (!username) return res.status(400).json({ error: 'username required' });
+
+  try {
+    // toggle: اگر هست حذف کن، اگر نیست اضافه کن
+    const existing = await pool.query(
+      'SELECT id FROM news_likes WHERE news_id=$1 AND username=$2',
+      [newsId, username]
+    );
+
+    if (existing.rows.length > 0) {
+      await pool.query(
+        'DELETE FROM news_likes WHERE news_id=$1 AND username=$2',
+        [newsId, username]
+      );
+      const count = await pool.query(
+        'SELECT COUNT(*) FROM news_likes WHERE news_id=$1', [newsId]
+      );
+      return res.json({ success: true, liked: false, likes_count: parseInt(count.rows[0].count) });
+    } else {
+      await pool.query(
+        'INSERT INTO news_likes (news_id, username) VALUES ($1, $2)',
+        [newsId, username]
+      );
+      const count = await pool.query(
+        'SELECT COUNT(*) FROM news_likes WHERE news_id=$1', [newsId]
+      );
+      return res.json({ success: true, liked: true, likes_count: parseInt(count.rows[0].count) });
+    }
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── گرفتن آمار یک خبر (لایک + کامنت) ───────────────────────────
+app.get('/api/news/:newsId/stats', async (req, res) => {
+  const { newsId } = req.params;
+  const { username } = req.query;
+  try {
+    const [likesRes, commentsRes, hasLikedRes] = await Promise.all([
+      pool.query('SELECT COUNT(*) FROM news_likes    WHERE news_id=$1', [newsId]),
+      pool.query('SELECT COUNT(*) FROM news_comments WHERE news_id=$1', [newsId]),
+      username
+        ? pool.query('SELECT 1 FROM news_likes WHERE news_id=$1 AND username=$2', [newsId, username])
+        : Promise.resolve({ rows: [] })
+    ]);
+    res.json({
+      likes_count:   parseInt(likesRes.rows[0].count),
+      comment_count: parseInt(commentsRes.rows[0].count),
+      has_liked:     hasLikedRes.rows.length > 0
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── ارسال کامنت ──────────────────────────────────────────────────
+app.post('/api/news/:newsId/comments', async (req, res) => {
+  const { newsId } = req.params;
+  const { username, display_name, avatar_url, content } = req.body;
+  if (!username || !content?.trim())
+    return res.status(400).json({ error: 'username and content required' });
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO news_comments (news_id, username, display_name, avatar_url, content)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [newsId, username, display_name || username, avatar_url || null, content.trim()]
+    );
+    res.json({ success: true, comment: result.rows[0] });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── گرفتن کامنت‌های یک خبر ───────────────────────────────────────
+app.get('/api/news/:newsId/comments', async (req, res) => {
+  const { newsId } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT * FROM news_comments WHERE news_id=$1 ORDER BY created_at ASC`,
+      [newsId]
+    );
+    res.json({ success: true, comments: result.rows });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 /** GET /health */
 app.get('/health', async (req, res) => {
   try {
@@ -308,7 +424,13 @@ app.get('/health', async (req, res) => {
 /** GET / */
 app.get('/', (req, res) => res.json({
   service:   'AJ Sports RSS Bot v2.0 — Isolated',
-  endpoints: { news: '/api/news?lang=fa|en&limit=50', health: '/health' },
+  endpoints: { 
+    news: '/api/news?lang=fa|en&limit=50',
+    stats: '/api/news/:newsId/stats',
+    likes: 'POST /api/news/:newsId/like',
+    comments: 'GET/POST /api/news/:newsId/comments',
+    health: '/health' 
+  },
   bots:      BOTS.map(b => ({ name: b.name, display: b.display, feeds: b.feeds.length }))
 }));
 
@@ -341,3 +463,4 @@ process.on('SIGTERM', async () => {
   await pool.end();
   process.exit(0);
 });
+
