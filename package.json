@@ -1,15 +1,18 @@
 {
   "name": "aj-sports-rss-bot",
   "version": "2.0.0",
-  "description": "Isolated RSS bot — stores only in Bot DB, exposes /api/news",
+  "description": "AJ Sports RSS Bot Server",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=18.0.0" },
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
-    "cors":       "^2.8.5",
-    "dotenv":     "^16.4.5",
-    "node-cron":  "^3.0.3",
-    "pg":         "^8.11.5",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "node-cron": "^3.0.3",
+    "pg": "^8.11.3",
     "rss-parser": "^3.13.0"
   }
 }
+
