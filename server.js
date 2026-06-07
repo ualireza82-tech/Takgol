@@ -1,0 +1,507 @@
+/**
+ * AJ Sports 2026 — RSS Bot Server v3.0 ⚡ CACHED EDITION
+ *
+ * ✅ In-Memory Cache: ۲۰ میلیون کاربر فقط RAM را می‌خوانند — صفر Query به DB
+ * ✅ Cache-Control headers: Cloudflare این API را 5 دقیقه Edge Cache می‌کند
+ * ✅ Stampede Protection: اگر ۱۰۰۰ کاربر همزمان cache منقضی کنند، فقط ۱ DB query می‌رود
+ * ✅ Background Refresh: Cron job در پس‌زمینه cache را تازه می‌کند — نه در لحظه درخواست کاربر
+ * ✅ RSS → فقط bot_news در Bot DB ذخیره می‌شود
+ * ✅ دارای سیستم ایزوله لایک و کامنت با حذف خودکار (Cascade)
+ */
+
+require('dotenv').config();
+const express  = require('express');
+const { Pool } = require('pg');
+const cron     = require('node-cron');
+const Parser   = require('rss-parser');
+const cors     = require('cors');
+
+const app  = express();
+const PORT = process.env.PORT || 3000;
+
+// ═══════════════════════════════════════════
+// ENV
+// ═══════════════════════════════════════════
+const BOT_DB_URL   = process.env.BOT_DATABASE_URL;
+const NEWS_TTL_MIN = parseInt(process.env.NEWS_TTL_MINUTES    || '120');
+const FETCH_MIN    = parseInt(process.env.FETCH_INTERVAL_MIN  || '3');
+const MAX_ITEMS    = parseInt(process.env.MAX_ITEMS_PER_FEED  || '5');
+
+if (!BOT_DB_URL) {
+  console.error('❌ BOT_DATABASE_URL is required');
+  process.exit(1);
+}
+
+// ═══════════════════════════════════════════
+// CORS — با Cache-Control header
+// ═══════════════════════════════════════════
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE'] }));
+app.use(express.json());
+
+// ═══════════════════════════════════════════
+// DATABASE — فقط Bot DB
+// ═══════════════════════════════════════════
+const pool = new Pool({
+  connectionString: BOT_DB_URL,
+  ssl: { rejectUnauthorized: false },
+  max: 5,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 8000
+});
+pool.on('error', err => console.error('❌ DB pool error:', err.message));
+
+// ═══════════════════════════════════════════
+// ⚡ IN-MEMORY CACHE — قلب معماری ضدگلوله
+// ═══════════════════════════════════════════
+// این ساختار در RAM سرور زندگی می‌کند.
+// هر درخواست کاربر: خواندن از متغیر = زیر 0.1ms، صفر شبکه، صفر DB.
+// Cron job هر 3 دقیقه یک بار DB را کوئری می‌کند و این را آپدیت می‌کند.
+const newsMemCache = {
+  data: null,          // آرایه JSON آماده برای ارسال
+  updatedAt: 0,        // timestamp آخرین refresh
+  isRefreshing: false, // Stampede lock
+  TTL_MS: 3 * 60 * 1000 // 3 دقیقه (برابر fetch interval)
+};
+
+// ═══════════════════════════════════════════
+// BOT ACCOUNTS DEFINITION
+// ═══════════════════════════════════════════
+const BOTS = [
+  {
+    name:    'khabar_varzeshi',
+    display: 'خبرورزشی 📰',
+    lang:    'fa',
+    feeds: [
+      { url: 'https://www.irna.ir/rss/tp/14',            source: 'ایرنا'        },
+      { url: 'https://www.khabaronline.ir/rss/tp/6',     source: 'خبرآنلاین'   },
+      { url: 'https://kayhanvarzeshi.ir/fa/rss/allnews', source: 'کیهان ورزشی' },
+      { url: 'https://www.tabnak.ir/fa/rss/2',           source: 'تابناک'       },
+      { url: 'https://borna.news/fa/rss/7',              source: 'برنا'         }
+    ]
+  },
+  {
+    name:    'khabar_foori_sport',
+    display: 'خبر فوری ورزشی ⚡',
+    lang:    'fa',
+    feeds: [
+      {
+        url:    'https://www.khabarfoori.com/fa/feeds/?p=Y2F0ZWdvcmllcz0xNzMmZGF0ZVJhbmdlJTVCc3RhcnQlNUQ9LTYwNDgwMCZwb3NpdGlvbkZyb250PTQ%2C',
+        source: 'خبر فوری'
+      }
+    ]
+  },
+  {
+    name:    'sport_news_en',
+    display: 'Sport News 🌍',
+    lang:    'en',
+    feeds: [
+      { url: 'https://media.rss.com/world-cup-watchpoint/feed.xml', source: 'World Cup Watch' },
+      { url: 'https://e00-marca.uecdn.es/rss/en/index.xml',         source: 'Marca EN'        }
+    ]
+  }
+];
+
+// ═══════════════════════════════════════════
+// RSS PARSER
+// ═══════════════════════════════════════════
+const rssParser = new Parser({
+  timeout: 12000,
+  headers: {
+    'User-Agent': 'Mozilla/5.0 (compatible; AJSportsRSSBot/2.0)',
+    'Accept': 'application/rss+xml, application/xml, text/xml, */*'
+  },
+  customFields: {
+    item: [
+      ['media:content',   'mediaContent',   { keepArray: false }],
+      ['media:thumbnail', 'mediaThumbnail', { keepArray: false }],
+      ['enclosure',       'enclosure']
+    ]
+  }
+});
+
+// ═══════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════
+function extractImage(item) {
+  if (item.mediaContent) {
+    const u = item.mediaContent?.$.url || item.mediaContent?.url;
+    if (u) return u;
+  }
+  if (item.mediaThumbnail) {
+    const u = item.mediaThumbnail?.$.url || item.mediaThumbnail?.url;
+    if (u) return u;
+  }
+  if (item.enclosure?.url) {
+    const t = item.enclosure.type || '';
+    if (t.startsWith('image/') || /\.(jpg|jpeg|png|webp|gif)/i.test(item.enclosure.url))
+      return item.enclosure.url;
+  }
+  const html = item['content:encoded'] || item.content || item.description || '';
+  const m    = html.match(/<img[^>]+src=["']([^"']+)["']/i);
+  if (m && m[1] && !m[1].startsWith('data:')) return m[1];
+  return null;
+}
+
+function itemGuid(item) {
+  return item.guid || item.link || item.title || `${Date.now()}-${Math.random()}`;
+}
+
+// ═══════════════════════════════════════════
+// DB INIT
+// ═══════════════════════════════════════════
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bot_news (
+      id           SERIAL      PRIMARY KEY,
+      guid         TEXT        UNIQUE NOT NULL,
+      bot_name     TEXT        NOT NULL,
+      bot_display  TEXT        NOT NULL,
+      source       TEXT        NOT NULL,
+      lang         TEXT        NOT NULL DEFAULT 'fa',
+      title        TEXT        NOT NULL,
+      link         TEXT,
+      image_url    TEXT,
+      published_at TIMESTAMPTZ,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_bn_created ON bot_news (created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_bn_lang    ON bot_news (lang);
+    CREATE INDEX IF NOT EXISTS idx_bn_bot     ON bot_news (bot_name);
+
+    CREATE TABLE IF NOT EXISTS news_likes (
+      id         SERIAL      PRIMARY KEY,
+      news_id    INT         NOT NULL REFERENCES bot_news(id) ON DELETE CASCADE,
+      username   TEXT        NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(news_id, username)
+    );
+    CREATE INDEX IF NOT EXISTS idx_nl_news_id ON news_likes (news_id);
+
+    CREATE TABLE IF NOT EXISTS news_comments (
+      id           SERIAL      PRIMARY KEY,
+      news_id      INT         NOT NULL REFERENCES bot_news(id) ON DELETE CASCADE,
+      username     TEXT        NOT NULL,
+      display_name TEXT,
+      avatar_url   TEXT,
+      content      TEXT        NOT NULL,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_nc_news_id ON news_comments (news_id);
+    CREATE INDEX IF NOT EXISTS idx_nc_created ON news_comments (created_at ASC);
+  `);
+  console.log('✅ Tables ready: bot_news, news_likes, news_comments');
+}
+
+// ═══════════════════════════════════════════
+// ⚡ CACHE REFRESH — فقط این تابع به DB می‌زند
+// ═══════════════════════════════════════════
+async function refreshNewsCache(lang = null, limit = 50) {
+  if (newsMemCache.isRefreshing) return; // Stampede protection
+  newsMemCache.isRefreshing = true;
+
+  try {
+    const r = await pool.query(
+      `SELECT id, bot_name, bot_display, source, lang,
+              title, link, image_url, published_at, created_at
+       FROM bot_news
+       ORDER BY created_at DESC
+       LIMIT $1`,
+      [limit]
+    );
+    newsMemCache.data      = r.rows;
+    newsMemCache.updatedAt = Date.now();
+    console.log(`⚡ News cache refreshed: ${r.rows.length} items`);
+  } catch (err) {
+    console.error('❌ Cache refresh failed:', err.message);
+  } finally {
+    newsMemCache.isRefreshing = false;
+  }
+}
+
+// ═══════════════════════════════════════════
+// FETCH RSS & SAVE TO BOT DB
+// ═══════════════════════════════════════════
+async function processFeed(bot, feed) {
+  let feedData;
+  try {
+    feedData = await rssParser.parseURL(feed.url);
+  } catch (err) {
+    console.error(`  ❌ [${feed.source}] ${err.message}`);
+    return 0;
+  }
+
+  const items = (feedData.items || []).slice(0, MAX_ITEMS);
+  let saved = 0;
+
+  for (const item of items) {
+    const guid  = itemGuid(item);
+    const title = (item.title || '').trim().substring(0, 300);
+    if (!title) continue;
+
+    try {
+      const r = await pool.query(
+        `INSERT INTO bot_news
+           (guid, bot_name, bot_display, source, lang, title, link, image_url, published_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         ON CONFLICT (guid) DO NOTHING
+         RETURNING id`,
+        [
+          guid,
+          bot.name,
+          bot.display,
+          feed.source,
+          bot.lang,
+          title,
+          item.link   || null,
+          extractImage(item),
+          item.pubDate ? new Date(item.pubDate) : null
+        ]
+      );
+
+      if (r.rows.length > 0) {
+        saved++;
+        console.log(`  ✅ [${bot.name}] ${title.substring(0, 55)}...`);
+      }
+    } catch (err) {
+      console.error(`  ❌ Insert: ${err.message}`);
+    }
+
+    await new Promise(r => setTimeout(r, 300));
+  }
+  return saved;
+}
+
+async function runAllFeeds() {
+  const t = Date.now();
+  console.log(`\n🔄 RSS fetch — ${new Date().toLocaleTimeString('fa-IR')}`);
+  let total = 0;
+
+  for (const bot of BOTS) {
+    for (const feed of bot.feeds) {
+      total += await processFeed(bot, feed);
+      await new Promise(r => setTimeout(r, 500));
+    }
+  }
+
+  console.log(`📦 ${total} new items saved (${Date.now() - t}ms)`);
+
+  // بعد از هر RSS fetch، cache را آپدیت کن
+  await refreshNewsCache();
+}
+
+// ═══════════════════════════════════════════
+// AUTO CLEANUP
+// ═══════════════════════════════════════════
+async function cleanup() {
+  const cutoff = new Date(Date.now() - NEWS_TTL_MIN * 60 * 1000);
+  const r = await pool.query(
+    'DELETE FROM bot_news WHERE created_at < $1 RETURNING id',
+    [cutoff]
+  );
+  if (r.rows.length > 0) {
+    console.log(`🧹 Cleaned ${r.rows.length} old news + their likes/comments`);
+    // بعد از cleanup، cache را refresh کن
+    await refreshNewsCache();
+  }
+}
+
+// ═══════════════════════════════════════════
+// CRON JOBS
+// ═══════════════════════════════════════════
+cron.schedule(`*/${FETCH_MIN} * * * *`, runAllFeeds);
+cron.schedule('*/10 * * * *',          cleanup);
+
+// ═══════════════════════════════════════════
+// API ENDPOINTS
+// ═══════════════════════════════════════════
+
+/**
+ * GET /api/news
+ * ⚡ از in-memory cache می‌خواند — صفر DB query برای ۲۰ میلیون کاربر
+ * Cache-Control header → Cloudflare Edge Cache این endpoint را 5 دقیقه کش می‌کند
+ */
+app.get('/api/news', async (req, res) => {
+  try {
+    const { lang, bot, limit = 50 } = req.query;
+    const limitNum = Math.min(parseInt(limit) || 50, 100);
+
+    // اگر cache خالی است یا قدیمی، یک بار refresh کن
+    if (!newsMemCache.data || (Date.now() - newsMemCache.updatedAt) > newsMemCache.TTL_MS) {
+      await refreshNewsCache(null, 100);
+    }
+
+    let news = newsMemCache.data || [];
+
+    // فیلتر در حافظه — بدون هیچ DB query
+    if (lang) news = news.filter(n => n.lang === lang);
+    if (bot)  news = news.filter(n => n.bot_name === bot);
+    news = news.slice(0, limitNum);
+
+    // Cache-Control: به Cloudflare بگو این را 5 دقیقه Edge Cache کند
+    // نتیجه: فقط نفر اول به این سرور می‌رسد، بقیه از Cloudflare CDN می‌خوانند
+    res.set({
+      'Cache-Control': 'public, s-maxage=300, stale-while-revalidate=60',
+      'CDN-Cache-Control': 'public, max-age=300',
+      'Cloudflare-CDN-Cache-Control': 'public, max-age=300'
+    });
+
+    res.json({ success: true, count: news.length, news, cached_at: new Date(newsMemCache.updatedAt).toISOString() });
+  } catch (err) {
+    console.error('❌ /api/news:', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── لایک خبر ─────────────────────────────────────────────────────
+app.post('/api/news/:newsId/like', async (req, res) => {
+  const { newsId } = req.params;
+  const { username } = req.body;
+  if (!username) return res.status(400).json({ error: 'username required' });
+
+  try {
+    const existing = await pool.query(
+      'SELECT id FROM news_likes WHERE news_id=$1 AND username=$2',
+      [newsId, username]
+    );
+
+    if (existing.rows.length > 0) {
+      await pool.query(
+        'DELETE FROM news_likes WHERE news_id=$1 AND username=$2',
+        [newsId, username]
+      );
+      const count = await pool.query(
+        'SELECT COUNT(*) FROM news_likes WHERE news_id=$1', [newsId]
+      );
+      return res.json({ success: true, liked: false, likes_count: parseInt(count.rows[0].count) });
+    } else {
+      await pool.query(
+        'INSERT INTO news_likes (news_id, username) VALUES ($1, $2)',
+        [newsId, username]
+      );
+      const count = await pool.query(
+        'SELECT COUNT(*) FROM news_likes WHERE news_id=$1', [newsId]
+      );
+      return res.json({ success: true, liked: true, likes_count: parseInt(count.rows[0].count) });
+    }
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── گرفتن آمار یک خبر ───────────────────────────────────────────
+app.get('/api/news/:newsId/stats', async (req, res) => {
+  const { newsId } = req.params;
+  const { username } = req.query;
+  try {
+    const [likesRes, commentsRes, hasLikedRes] = await Promise.all([
+      pool.query('SELECT COUNT(*) FROM news_likes    WHERE news_id=$1', [newsId]),
+      pool.query('SELECT COUNT(*) FROM news_comments WHERE news_id=$1', [newsId]),
+      username
+        ? pool.query('SELECT 1 FROM news_likes WHERE news_id=$1 AND username=$2', [newsId, username])
+        : Promise.resolve({ rows: [] })
+    ]);
+    res.json({
+      likes_count:   parseInt(likesRes.rows[0].count),
+      comment_count: parseInt(commentsRes.rows[0].count),
+      has_liked:     hasLikedRes.rows.length > 0
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── ارسال کامنت ──────────────────────────────────────────────────
+app.post('/api/news/:newsId/comments', async (req, res) => {
+  const { newsId } = req.params;
+  const { username, display_name, avatar_url, content } = req.body;
+  if (!username || !content?.trim())
+    return res.status(400).json({ error: 'username and content required' });
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO news_comments (news_id, username, display_name, avatar_url, content)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [newsId, username, display_name || username, avatar_url || null, content.trim()]
+    );
+    res.json({ success: true, comment: result.rows[0] });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── گرفتن کامنت‌های یک خبر ───────────────────────────────────────
+app.get('/api/news/:newsId/comments', async (req, res) => {
+  const { newsId } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT * FROM news_comments WHERE news_id=$1 ORDER BY created_at ASC`,
+      [newsId]
+    );
+    res.json({ success: true, comments: result.rows });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/** GET /health */
+app.get('/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    const r = await pool.query('SELECT COUNT(*) FROM bot_news');
+    res.json({
+      status:       'ok',
+      news_total:   parseInt(r.rows[0].count),
+      cache_items:  newsMemCache.data?.length || 0,
+      cache_age_s:  Math.floor((Date.now() - newsMemCache.updatedAt) / 1000),
+      ttl_min:      NEWS_TTL_MIN,
+      fetch_min:    FETCH_MIN,
+      bots:         BOTS.length,
+      ts:           new Date().toISOString()
+    });
+  } catch (e) {
+    res.status(500).json({ status: 'error', error: e.message });
+  }
+});
+
+/** GET / */
+app.get('/', (req, res) => res.json({
+  service:   'AJ Sports RSS Bot v3.0 — Cached & Bulletproof ⚡',
+  endpoints: { 
+    news: '/api/news?lang=fa|en&limit=50',
+    stats: '/api/news/:newsId/stats',
+    likes: 'POST /api/news/:newsId/like',
+    comments: 'GET/POST /api/news/:newsId/comments',
+    health: '/health' 
+  },
+  bots: BOTS.map(b => ({ name: b.name, display: b.display, feeds: b.feeds.length }))
+}));
+
+// ═══════════════════════════════════════════
+// START
+// ═══════════════════════════════════════════
+async function start() {
+  console.log('\n' + '═'.repeat(60));
+  console.log('🤖 AJ Sports RSS Bot v3.0 — Cached & Bulletproof ⚡');
+  console.log('═'.repeat(60));
+  console.log(`📦 In-Memory Cache: ${newsMemCache.TTL_MS / 1000}s TTL`);
+  console.log(`⏰ RSS Fetch every ${FETCH_MIN}min | News TTL ${NEWS_TTL_MIN}min`);
+  console.log('═'.repeat(60) + '\n');
+
+  await initDB();
+
+  app.listen(PORT, () => {
+    console.log(`🚀 Bot server running on port ${PORT}`);
+    console.log(`📡 News API: http://localhost:${PORT}/api/news\n`);
+  });
+
+  // اولین RSS fetch بعد از 6 ثانیه
+  setTimeout(runAllFeeds, 6000);
+}
+
+start();
+
+process.on('SIGTERM', async () => {
+  console.log('Shutting down...');
+  await pool.end();
+  process.exit(0);
+});
