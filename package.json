@@ -1,25 +1,33 @@
 {
-  "name": "ajsports-rss-bot",
-  "version": "5.0.0",
-  "description": "AJ Sports RSS Bot — Cached & Bulletproof",
-  "main": "rss_bot_server_FINAL_v5.js",
-  "engines": {
-    "node": ">=18.0.0"
-  },
+  "name": "aj-sports-rss-bot-server",
+  "version": "4.0.0",
+  "description": "AJ Sports 2026 RSS Bot Server v4.0 - Secure Cached & Gemini Translate Edition",
+  "main": "server.js",
   "scripts": {
-    "start": "node rss_bot_server_FINAL_v5.js",
-    "dev": "nodemon rss_bot_server_FINAL_v5.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
+  "keywords": [
+    "express",
+    "rss-bot",
+    "gemini-api",
+    "security-hardened",
+    "postgresql",
+    "sports-news"
+  ],
+  "author": "Cyber Security Specialist",
+  "license": "MIT",
   "dependencies": {
     "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
     "node-cron": "^3.0.3",
-    "node-fetch": "^2.7.0",
-    "pg": "^8.11.5",
+    "pg": "^8.13.1",
     "rss-parser": "^3.13.0"
   },
-  "devDependencies": {
-    "nodemon": "^3.1.4"
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
+
