@@ -505,8 +505,8 @@ async function translateWithGemini(text, targetLang = 'fa') {
   
   try {
     const prompt = targetLang === 'fa'
-      ? `متن زیر را به فارسی روان و طبیعی ترجمه کن. فقط ترجمه را بنویس، بدون توضیح اضافه:\n\n${text}`
-      : `Translate the following text to English naturally. Only output the translation, no explanations:\n\n${text}`;
+      ? `این جمله را به فارسی ترجمه کن. فقط ترجمه فارسی را بنویس، هیچ چیز دیگری ننویس:\n${text}`
+      : `Translate to English, output only the translation:\n${text}`;
 
     const controller = new AbortController();
     // timeout 8 ثانیه — جلوگیری از بلوک شدن request کاربر
@@ -520,9 +520,9 @@ async function translateWithGemini(text, targetLang = 'fa') {
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
           generationConfig: {
-            temperature: 0.1,      // ترجمه نیاز به خلاقیت ندارد
-            maxOutputTokens: 512,  // عنوان خبر حداکثر ۵۱۲ توکن
-            topP: 0.8
+            temperature: 0.3,
+            maxOutputTokens: 512,
+            topP: 0.9
           }
         }),
         signal: controller.signal
