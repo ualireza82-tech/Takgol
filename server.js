@@ -1,5 +1,5 @@
 /**
- * AJ Sports 2026 — RSS Bot Server v3.0 ⚡ CACHED EDITION
+ * AJ Sports 2026 — RSS Bot Server v3.0 ⚡ CACHED EDITION + GEMINI TRANSLATE
  *
  * ✅ In-Memory Cache: ۲۰ میلیون کاربر فقط RAM را می‌خوانند — صفر Query به DB
  * ✅ Cache-Control headers: Cloudflare این API را 5 دقیقه Edge Cache می‌کند
@@ -7,6 +7,10 @@
  * ✅ Background Refresh: Cron job در پس‌زمینه cache را تازه می‌کند — نه در لحظه درخواست کاربر
  * ✅ RSS → فقط bot_news در Bot DB ذخیره می‌شود
  * ✅ دارای سیستم ایزوله لایک و کامنت با حذف خودکار (Cascade)
+ * ✅ [NEW v3.1] ترجمه خودکار عنوان خبر با Gemini Flash — endpoint: POST /api/translate
+ *    - کلید Gemini از env می‌آید (GEMINI_API_KEY) — در کد هاردکد نیست
+ *    - In-Memory Translation Cache: هر متن فقط یک بار به Gemini می‌رود
+ *    - Rate-Limit Safe: اگر Gemini خطا دهد، متن اصلی برگردانده می‌شود
  */
 
 require('dotenv').config();
@@ -22,10 +26,12 @@ const PORT = process.env.PORT || 3000;
 // ═══════════════════════════════════════════
 // ENV
 // ═══════════════════════════════════════════
-const BOT_DB_URL   = process.env.BOT_DATABASE_URL;
-const NEWS_TTL_MIN = parseInt(process.env.NEWS_TTL_MINUTES    || '120');
-const FETCH_MIN    = parseInt(process.env.FETCH_INTERVAL_MIN  || '3');
-const MAX_ITEMS    = parseInt(process.env.MAX_ITEMS_PER_FEED  || '5');
+const BOT_DB_URL    = process.env.BOT_DATABASE_URL;
+const NEWS_TTL_MIN  = parseInt(process.env.NEWS_TTL_MINUTES    || '120');
+const FETCH_MIN     = parseInt(process.env.FETCH_INTERVAL_MIN  || '3');
+const MAX_ITEMS     = parseInt(process.env.MAX_ITEMS_PER_FEED  || '5');
+// [NEW] کلید Gemini از .env — هیچ‌گاه در کد نوشته نمی‌شود
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 if (!BOT_DB_URL) {
   console.error('❌ BOT_DATABASE_URL is required');
@@ -53,22 +59,26 @@ pool.on('error', err => console.error('❌ DB pool error:', err.message));
 // ═══════════════════════════════════════════
 // ⚡ IN-MEMORY CACHE — قلب معماری ضدگلوله
 // ═══════════════════════════════════════════
-// این ساختار در RAM سرور زندگی می‌کند.
-// هر درخواست کاربر: خواندن از متغیر = زیر 0.1ms، صفر شبکه، صفر DB.
-// Cron job هر 3 دقیقه یک بار DB را کوئری می‌کند و این را آپدیت می‌کند.
 const newsMemCache = {
-  data: null,          // آرایه JSON آماده برای ارسال
-  updatedAt: 0,        // timestamp آخرین refresh
-  isRefreshing: false, // Stampede lock
-  TTL_MS: 3 * 60 * 1000 // 3 دقیقه (برابر fetch interval)
+  data: null,
+  updatedAt: 0,
+  isRefreshing: false,
+  TTL_MS: 3 * 60 * 1000
 };
 
 // ═══════════════════════════════════════════
-// 🤖 BOT PROFILE MAP — آواتار و اطلاعات هر بات
-// فرانت‌اند از bot_name برای نمایش آواتار و نام استفاده می‌کند
+// 🌐 [NEW] TRANSLATION CACHE — جلوگیری از درخواست‌های تکراری به Gemini
+// کلید: متن اصلی (trim شده) — مقدار: ترجمه فارسی
+// این cache در RAM زندگی می‌کند و با restart پاک می‌شود (مشکلی نیست)
+// ═══════════════════════════════════════════
+const translationCache = new Map();
+// حداکثر ۵۰۰۰ ورودی در حافظه (هر عنوان ~۲۰۰ کاراکتر → ~۱MB)
+const TRANSLATION_CACHE_MAX = 5000;
+
+// ═══════════════════════════════════════════
+// 🤖 BOT PROFILE MAP
 // ═══════════════════════════════════════════
 const BOT_PROFILES = {
-  // ── فارسی ─────────────────────────────────
   khabar_varzeshi: {
     avatar_url:   'https://ui-avatars.com/api/?name=%D8%AE%D8%A8%D8%B1+%D9%88%D8%B1%D8%B2%D8%B4%DB%8C&background=c62828&color=fff&size=128&bold=true&rounded=true',
     display_name: 'خبرورزشی 📰',
@@ -93,7 +103,6 @@ const BOT_PROFILES = {
     username:     'iran_football',
     verification: 'gold'
   },
-  // ── جام جهانی ۲۰۲۶ ────────────────────────
   fifa_worldcup2026: {
     avatar_url:   'https://ui-avatars.com/api/?name=FIFA+2026&background=0d47a1&color=FFD700&size=128&bold=true&rounded=true',
     display_name: 'FIFA World Cup 2026 🏆',
@@ -106,7 +115,6 @@ const BOT_PROFILES = {
     username:     'worldcup_news',
     verification: 'gold'
   },
-  // ── انگلیسی بین‌المللی ──────────────────────
   sport_news_en: {
     avatar_url:   'https://ui-avatars.com/api/?name=Sport+News&background=1565c0&color=fff&size=128&bold=true&rounded=true',
     display_name: 'Sport News 🌍',
@@ -145,11 +153,8 @@ const BOT_PROFILES = {
   }
 };
 
-
 // ═══════════════════════════════════════════
-// 🔔 KEEP-ALIVE — جلوگیری از خواب Render رایگان
-// Render free tier بعد از ۱۵ دقیقه بی‌ترافیک سرور را می‌خواباند.
-// این self-ping هر ۱۴ دقیقه یک بار سرور را بیدار نگه می‌دارد.
+// 🔔 KEEP-ALIVE
 // ═══════════════════════════════════════════
 function startKeepAlive() {
   const selfUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
@@ -160,16 +165,11 @@ function startKeepAlive() {
       await fetch(`${selfUrl}/health`, { signal: ctrl.signal });
       clearTimeout(t);
       console.log('💓 Keep-alive ping sent');
-    } catch (e) {
-      // سکوت — اگر ping خطا داد مهم نیست
-    }
-  }, 14 * 60 * 1000); // هر ۱۴ دقیقه
+    } catch (e) {}
+  }, 14 * 60 * 1000);
 }
 
 const BOTS = [
-  // ══════════════════════════════════════════════
-  // 🇮🇷 فارسی — خبرگزاری‌های ورزشی ایران
-  // ══════════════════════════════════════════════
   {
     name:    'khabar_varzeshi',
     display: 'خبرورزشی 📰',
@@ -209,16 +209,11 @@ const BOTS = [
       { url: 'https://persianfootball.com/news/feed/',   source: 'پرشین فوتبال'  }
     ]
   },
-
-  // ══════════════════════════════════════════════
-  // 🏆 جام جهانی ۲۰۲۶
-  // ══════════════════════════════════════════════
   {
     name:    'fifa_worldcup2026',
     display: 'FIFA World Cup 2026 🏆',
     lang:    'en',
     feeds: [
-      // Google News RSS برای جام جهانی — همیشه زنده
       { url: 'https://news.google.com/rss/search?q=FIFA+World+Cup+2026&hl=en-US&gl=US&ceid=US:en', source: 'Google News WC2026' },
       { url: 'https://news.google.com/rss/search?q=World+Cup+2026+goal+match&hl=en-US&gl=US&ceid=US:en', source: 'WC2026 Matches'  }
     ]
@@ -232,16 +227,11 @@ const BOTS = [
       { url: 'https://media.rss.com/world-cup-watchpoint/feed.xml',                               source: 'WC Watchpoint'   }
     ]
   },
-
-  // ══════════════════════════════════════════════
-  // 🌍 بین‌المللی — انگلیسی
-  // ══════════════════════════════════════════════
   {
     name:    'sky_sports',
     display: 'Sky Sports 🔵',
     lang:    'en',
     feeds: [
-      // Sky Sports Football RSS — فعال و معتبر
       { url: 'https://www.skysports.com/rss/12040', source: 'Sky Sports Football' },
       { url: 'https://www.skysports.com/rss/11095', source: 'Sky Sports News'     }
     ]
@@ -287,7 +277,6 @@ const BOTS = [
     display: 'Transfermarkt 💰',
     lang:    'en',
     feeds: [
-      // Google News RSS برای نقل‌وانتقالات — همیشه زنده
       { url: 'https://news.google.com/rss/search?q=football+transfer+2026&hl=en&gl=US&ceid=US:en', source: 'Transfer News'  },
       { url: 'https://www.caughtoffside.com/feed/',               source: 'CaughtOffside'  }
     ]
@@ -386,10 +375,10 @@ async function initDB() {
 }
 
 // ═══════════════════════════════════════════
-// ⚡ CACHE REFRESH — فقط این تابع به DB می‌زند
+// ⚡ CACHE REFRESH
 // ═══════════════════════════════════════════
 async function refreshNewsCache(lang = null, limit = 50) {
-  if (newsMemCache.isRefreshing) return; // Stampede protection
+  if (newsMemCache.isRefreshing) return;
   newsMemCache.isRefreshing = true;
 
   try {
@@ -404,13 +393,10 @@ async function refreshNewsCache(lang = null, limit = 50) {
     );
     newsMemCache.data      = r.rows.map(row => ({
       ...row,
-      // پروفایل بات را از BOT_PROFILES inject کن
-      // فرانت‌اند به avatar_url و username نیاز دارد
       avatar_url:   BOT_PROFILES[row.bot_name]?.avatar_url   || 'https://ui-avatars.com/api/?name=News&background=333&color=fff',
       username:     BOT_PROFILES[row.bot_name]?.username     || row.bot_name,
       display_name: BOT_PROFILES[row.bot_name]?.display_name || row.bot_display,
       verification: BOT_PROFILES[row.bot_name]?.verification || 'gold',
-      // created_at را به زمان واقعی انتشار تبدیل کن
       created_at:   row.effective_at || row.published_at || row.created_at
     }));
     newsMemCache.updatedAt = Date.now();
@@ -450,18 +436,11 @@ async function processFeed(bot, feed) {
          ON CONFLICT (guid) DO NOTHING
          RETURNING id`,
         [
-          guid,
-          bot.name,
-          bot.display,
-          feed.source,
-          bot.lang,
-          title,
-          item.link   || null,
-          extractImage(item),
+          guid, bot.name, bot.display, feed.source, bot.lang, title,
+          item.link || null, extractImage(item),
           item.pubDate ? new Date(item.pubDate) : null
         ]
       );
-
       if (r.rows.length > 0) {
         saved++;
         console.log(`  ✅ [${bot.name}] ${title.substring(0, 55)}...`);
@@ -469,7 +448,6 @@ async function processFeed(bot, feed) {
     } catch (err) {
       console.error(`  ❌ Insert: ${err.message}`);
     }
-
     await new Promise(r => setTimeout(r, 300));
   }
   return saved;
@@ -479,17 +457,13 @@ async function runAllFeeds() {
   const t = Date.now();
   console.log(`\n🔄 RSS fetch — ${new Date().toLocaleTimeString('fa-IR')}`);
   let total = 0;
-
   for (const bot of BOTS) {
     for (const feed of bot.feeds) {
       total += await processFeed(bot, feed);
       await new Promise(r => setTimeout(r, 500));
     }
   }
-
   console.log(`📦 ${total} new items saved (${Date.now() - t}ms)`);
-
-  // بعد از هر RSS fetch، cache را آپدیت کن
   await refreshNewsCache();
 }
 
@@ -498,13 +472,9 @@ async function runAllFeeds() {
 // ═══════════════════════════════════════════
 async function cleanup() {
   const cutoff = new Date(Date.now() - NEWS_TTL_MIN * 60 * 1000);
-  const r = await pool.query(
-    'DELETE FROM bot_news WHERE created_at < $1 RETURNING id',
-    [cutoff]
-  );
+  const r = await pool.query('DELETE FROM bot_news WHERE created_at < $1 RETURNING id', [cutoff]);
   if (r.rows.length > 0) {
     console.log(`🧹 Cleaned ${r.rows.length} old news + their likes/comments`);
-    // بعد از cleanup، cache را refresh کن
     await refreshNewsCache();
   }
 }
@@ -516,39 +486,119 @@ cron.schedule(`*/${FETCH_MIN} * * * *`, runAllFeeds);
 cron.schedule('*/10 * * * *',          cleanup);
 
 // ═══════════════════════════════════════════
+// 🌐 [NEW] GEMINI TRANSLATION ENGINE
+// این تابع متن را با Gemini Flash ترجمه می‌کند.
+// - اگر متن از قبل در translationCache باشد، همان را برمی‌گرداند (صفر API call)
+// - اگر Gemini خطا دهد یا timeout شود، متن اصلی برگردانده می‌شود
+// - هیچ dependency جدیدی اضافه نشده — از fetch داخلی Node 18+ استفاده می‌شود
+// ═══════════════════════════════════════════
+async function translateWithGemini(text, targetLang = 'fa') {
+  // اعتبارسنجی ورودی
+  if (!text || typeof text !== 'string' || text.trim().length < 3) return text;
+  
+  const cacheKey = `${targetLang}::${text.trim()}`;
+  
+  // بررسی cache
+  if (translationCache.has(cacheKey)) {
+    return translationCache.get(cacheKey);
+  }
+  
+  // اگر متن از قبل فارسی است، نیازی به ترجمه نیست
+  if (targetLang === 'fa' && /[\u0600-\u06FF]/.test(text) && !/[a-zA-Z]{5,}/.test(text)) {
+    translationCache.set(cacheKey, text);
+    return text;
+  }
+
+  try {
+    const prompt = targetLang === 'fa'
+      ? `متن زیر را به فارسی روان و طبیعی ترجمه کن. فقط ترجمه را بنویس، بدون توضیح اضافه:\n\n${text}`
+      : `Translate the following text to English naturally. Only output the translation, no explanations:\n\n${text}`;
+
+    const controller = new AbortController();
+    // timeout 8 ثانیه — جلوگیری از بلوک شدن request کاربر
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
+
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            temperature: 0.1,      // ترجمه نیاز به خلاقیت ندارد
+            maxOutputTokens: 512,  // عنوان خبر حداکثر ۵۱۲ توکن
+            topP: 0.8
+          }
+        }),
+        signal: controller.signal
+      }
+    );
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      const errBody = await response.text().catch(() => '');
+      console.error(`❌ Gemini API error ${response.status}: ${errBody.substring(0, 200)}`);
+      return text; // fallback: متن اصلی
+    }
+
+    const data = await response.json();
+    const translated = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+
+    if (!translated) {
+      console.warn('⚠️ Gemini returned empty translation');
+      return text;
+    }
+
+    // ذخیره در cache — با مدیریت سایز
+    if (translationCache.size >= TRANSLATION_CACHE_MAX) {
+      // پاک کردن اولین ۵۰۰ ورودی قدیمی (FIFO)
+      const keysToDelete = Array.from(translationCache.keys()).slice(0, 500);
+      keysToDelete.forEach(k => translationCache.delete(k));
+      console.log('🧹 Translation cache pruned: 500 old entries removed');
+    }
+    translationCache.set(cacheKey, translated);
+    
+    console.log(`🌐 Translated: "${text.substring(0, 40)}..." → "${translated.substring(0, 40)}..."`);
+    return translated;
+
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      console.warn('⏱️ Gemini translation timeout — returning original');
+    } else {
+      console.error('❌ Gemini translation error:', err.message);
+    }
+    return text; // fallback امن: متن اصلی
+  }
+}
+
+// ═══════════════════════════════════════════
 // API ENDPOINTS
 // ═══════════════════════════════════════════
 
 /**
  * GET /api/news
- * ⚡ از in-memory cache می‌خواند — صفر DB query برای ۲۰ میلیون کاربر
- * Cache-Control header → Cloudflare Edge Cache این endpoint را 5 دقیقه کش می‌کند
+ * ⚡ از in-memory cache می‌خواند
  */
 app.get('/api/news', async (req, res) => {
   try {
     const { lang, bot, limit = 50 } = req.query;
     const limitNum = Math.min(parseInt(limit) || 50, 100);
 
-    // اگر cache خالی است یا قدیمی، یک بار refresh کن
     if (!newsMemCache.data || (Date.now() - newsMemCache.updatedAt) > newsMemCache.TTL_MS) {
       await refreshNewsCache(null, 100);
     }
 
     let news = newsMemCache.data || [];
-
-    // فیلتر در حافظه — بدون هیچ DB query
     if (lang) news = news.filter(n => n.lang === lang);
     if (bot)  news = news.filter(n => n.bot_name === bot);
 
-    // مهم: created_at را به زمان واقعی انتشار (published_at) تبدیل کن
-    // فرانت‌اند از n.created_at برای timeAgo استفاده می‌کند
     news = news.slice(0, limitNum).map(n => ({
       ...n,
       created_at: n.effective_at || n.published_at || n.created_at
     }));
 
-    // Cache-Control: به Cloudflare بگو این را 5 دقیقه Edge Cache کند
-    // نتیجه: فقط نفر اول به این سرور می‌رسد، بقیه از Cloudflare CDN می‌خوانند
     res.set({
       'Cache-Control': 'public, s-maxage=300, stale-while-revalidate=60',
       'CDN-Cache-Control': 'public, max-age=300',
@@ -562,6 +612,56 @@ app.get('/api/news', async (req, res) => {
   }
 });
 
+// ── [NEW] ترجمه خبر با Gemini ────────────────────────────────────────────────
+/**
+ * POST /api/translate
+ * Body: { text: string, target_lang?: 'fa' | 'en' }
+ * Response: { success: true, translated: string, cached: boolean }
+ *
+ * این endpoint کاملاً مستقل از سایر endpoint‌هاست.
+ * هیچ تغییری در DB schema نمی‌دهد.
+ * از in-memory translation cache استفاده می‌کند.
+ */
+app.post('/api/translate', async (req, res) => {
+  try {
+    const { text, target_lang = 'fa' } = req.body;
+    
+    if (!text || typeof text !== 'string') {
+      return res.status(400).json({ success: false, error: 'text is required' });
+    }
+    
+    if (!['fa', 'en'].includes(target_lang)) {
+      return res.status(400).json({ success: false, error: 'target_lang must be fa or en' });
+    }
+    
+    const trimmedText = text.trim();
+    if (trimmedText.length < 3) {
+      return res.json({ success: true, translated: text, cached: false });
+    }
+    
+    // بررسی cache قبل از فراخوانی Gemini
+    const cacheKey = `${target_lang}::${trimmedText}`;
+    const wasCached = translationCache.has(cacheKey);
+    
+    const translated = await translateWithGemini(trimmedText, target_lang);
+    
+    // Cache-Control: نتیجه ترجمه را می‌توان در Edge نگه داشت (متن+زبان ثابت = جواب ثابت)
+    res.set('Cache-Control', 'public, s-maxage=86400'); // 24 ساعت
+    
+    res.json({
+      success: true,
+      translated,
+      cached: wasCached,
+      original: trimmedText
+    });
+    
+  } catch (err) {
+    console.error('❌ /api/translate:', err.message);
+    // حتی در خطا، متن اصلی را برگردان تا UI خراب نشود
+    res.json({ success: true, translated: req.body?.text || '', cached: false });
+  }
+});
+
 // ── لایک خبر ─────────────────────────────────────────────────────
 app.post('/api/news/:newsId/like', async (req, res) => {
   const { newsId } = req.params;
@@ -570,27 +670,15 @@ app.post('/api/news/:newsId/like', async (req, res) => {
 
   try {
     const existing = await pool.query(
-      'SELECT id FROM news_likes WHERE news_id=$1 AND username=$2',
-      [newsId, username]
+      'SELECT id FROM news_likes WHERE news_id=$1 AND username=$2', [newsId, username]
     );
-
     if (existing.rows.length > 0) {
-      await pool.query(
-        'DELETE FROM news_likes WHERE news_id=$1 AND username=$2',
-        [newsId, username]
-      );
-      const count = await pool.query(
-        'SELECT COUNT(*) FROM news_likes WHERE news_id=$1', [newsId]
-      );
+      await pool.query('DELETE FROM news_likes WHERE news_id=$1 AND username=$2', [newsId, username]);
+      const count = await pool.query('SELECT COUNT(*) FROM news_likes WHERE news_id=$1', [newsId]);
       return res.json({ success: true, liked: false, likes_count: parseInt(count.rows[0].count) });
     } else {
-      await pool.query(
-        'INSERT INTO news_likes (news_id, username) VALUES ($1, $2)',
-        [newsId, username]
-      );
-      const count = await pool.query(
-        'SELECT COUNT(*) FROM news_likes WHERE news_id=$1', [newsId]
-      );
+      await pool.query('INSERT INTO news_likes (news_id, username) VALUES ($1, $2)', [newsId, username]);
+      const count = await pool.query('SELECT COUNT(*) FROM news_likes WHERE news_id=$1', [newsId]);
       return res.json({ success: true, liked: true, likes_count: parseInt(count.rows[0].count) });
     }
   } catch(e) {
@@ -598,7 +686,7 @@ app.post('/api/news/:newsId/like', async (req, res) => {
   }
 });
 
-// ── گرفتن آمار یک خبر ───────────────────────────────────────────
+// ── آمار خبر ─────────────────────────────────────────────────────
 app.get('/api/news/:newsId/stats', async (req, res) => {
   const { newsId } = req.params;
   const { username } = req.query;
@@ -620,13 +708,12 @@ app.get('/api/news/:newsId/stats', async (req, res) => {
   }
 });
 
-// ── ارسال کامنت ──────────────────────────────────────────────────
+// ── کامنت‌های خبر ─────────────────────────────────────────────────
 app.post('/api/news/:newsId/comments', async (req, res) => {
   const { newsId } = req.params;
   const { username, display_name, avatar_url, content } = req.body;
   if (!username || !content?.trim())
     return res.status(400).json({ error: 'username and content required' });
-
   try {
     const result = await pool.query(
       `INSERT INTO news_comments (news_id, username, display_name, avatar_url, content)
@@ -639,13 +726,11 @@ app.post('/api/news/:newsId/comments', async (req, res) => {
   }
 });
 
-// ── گرفتن کامنت‌های یک خبر ───────────────────────────────────────
 app.get('/api/news/:newsId/comments', async (req, res) => {
   const { newsId } = req.params;
   try {
     const result = await pool.query(
-      `SELECT * FROM news_comments WHERE news_id=$1 ORDER BY created_at ASC`,
-      [newsId]
+      `SELECT * FROM news_comments WHERE news_id=$1 ORDER BY created_at ASC`, [newsId]
     );
     res.json({ success: true, comments: result.rows });
   } catch(e) {
@@ -659,14 +744,16 @@ app.get('/health', async (req, res) => {
     await pool.query('SELECT 1');
     const r = await pool.query('SELECT COUNT(*) FROM bot_news');
     res.json({
-      status:       'ok',
-      news_total:   parseInt(r.rows[0].count),
-      cache_items:  newsMemCache.data?.length || 0,
-      cache_age_s:  Math.floor((Date.now() - newsMemCache.updatedAt) / 1000),
-      ttl_min:      NEWS_TTL_MIN,
-      fetch_min:    FETCH_MIN,
-      bots:         BOTS.length,
-      ts:           new Date().toISOString()
+      status:            'ok',
+      news_total:        parseInt(r.rows[0].count),
+      cache_items:       newsMemCache.data?.length || 0,
+      cache_age_s:       Math.floor((Date.now() - newsMemCache.updatedAt) / 1000),
+      translation_cache: translationCache.size,
+      ttl_min:           NEWS_TTL_MIN,
+      fetch_min:         FETCH_MIN,
+      bots:              BOTS.length,
+      gemini_ready:      !!GEMINI_API_KEY,
+      ts:                new Date().toISOString()
     });
   } catch (e) {
     res.status(500).json({ status: 'error', error: e.message });
@@ -675,13 +762,14 @@ app.get('/health', async (req, res) => {
 
 /** GET / */
 app.get('/', (req, res) => res.json({
-  service:   'AJ Sports RSS Bot v3.0 — Cached & Bulletproof ⚡',
-  endpoints: { 
-    news: '/api/news?lang=fa|en&limit=50',
-    stats: '/api/news/:newsId/stats',
-    likes: 'POST /api/news/:newsId/like',
-    comments: 'GET/POST /api/news/:newsId/comments',
-    health: '/health' 
+  service:   'AJ Sports RSS Bot v3.1 — Cached & Gemini Translate ⚡🌐',
+  endpoints: {
+    news:      '/api/news?lang=fa|en&limit=50',
+    translate: 'POST /api/translate  {text, target_lang}',
+    stats:     '/api/news/:newsId/stats',
+    likes:     'POST /api/news/:newsId/like',
+    comments:  'GET/POST /api/news/:newsId/comments',
+    health:    '/health'
   },
   bots: BOTS.map(b => ({ name: b.name, display: b.display, feeds: b.feeds.length }))
 }));
@@ -691,23 +779,22 @@ app.get('/', (req, res) => res.json({
 // ═══════════════════════════════════════════
 async function start() {
   console.log('\n' + '═'.repeat(60));
-  console.log('🤖 AJ Sports RSS Bot v3.0 — Cached & Bulletproof ⚡');
+  console.log('🤖 AJ Sports RSS Bot v3.1 — Cached & Gemini Translate ⚡🌐');
   console.log('═'.repeat(60));
   console.log(`📦 In-Memory Cache: ${newsMemCache.TTL_MS / 1000}s TTL`);
   console.log(`⏰ RSS Fetch every ${FETCH_MIN}min | News TTL ${NEWS_TTL_MIN}min`);
+  console.log(`🌐 Gemini API: ${GEMINI_API_KEY ? '✅ Ready' : '❌ Missing GEMINI_API_KEY'}`);
   console.log('═'.repeat(60) + '\n');
 
   await initDB();
 
   app.listen(PORT, () => {
     console.log(`🚀 Bot server running on port ${PORT}`);
-    console.log(`📡 News API: http://localhost:${PORT}/api/news\n`);
+    console.log(`📡 News API:       http://localhost:${PORT}/api/news`);
+    console.log(`🌐 Translate API:  http://localhost:${PORT}/api/translate\n`);
   });
 
-  // اولین RSS fetch بعد از 6 ثانیه
   setTimeout(runAllFeeds, 6000);
-
-  // Keep-alive: جلوگیری از خواب Render رایگان
   startKeepAlive();
 }
 
