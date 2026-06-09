@@ -503,12 +503,6 @@ async function translateWithGemini(text, targetLang = 'fa') {
     return translationCache.get(cacheKey);
   }
   
-  // اگر متن از قبل فارسی است، نیازی به ترجمه نیست
-  if (targetLang === 'fa' && /[\u0600-\u06FF]/.test(text) && !/[a-zA-Z]{5,}/.test(text)) {
-    translationCache.set(cacheKey, text);
-    return text;
-  }
-
   try {
     const prompt = targetLang === 'fa'
       ? `متن زیر را به فارسی روان و طبیعی ترجمه کن. فقط ترجمه را بنویس، بدون توضیح اضافه:\n\n${text}`
