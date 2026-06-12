@@ -11,6 +11,9 @@
  *    - بدون نیاز به هیچ گونه API Key (حذف وابستگی به Gemini)
  *    - In-Memory Translation Cache: هر متن فقط یک بار ترجمه می‌شود
  *    - Rate-Limit Safe: دارای سیستم Fallback (بازگشت متن اصلی در صورت قطعی شبکه)
+ * ✅ [UPDATE v3.3] افزودن Live Fan Rooms Proxy (APIFootball Cached Endpoint)
+ *    - بدون هیچ تغییری در منطق RSS / لایک / کامنت / ترجمه قبلی
+ *    - فقط افزونه: GET /live_matches.json (کش‌شده، هر ۵ دقیقه)
  */
 
 require('dotenv').config();
@@ -30,6 +33,10 @@ const BOT_DB_URL    = process.env.BOT_DATABASE_URL;
 const NEWS_TTL_MIN  = parseInt(process.env.NEWS_TTL_MINUTES    || '120');
 const FETCH_MIN     = parseInt(process.env.FETCH_INTERVAL_MIN  || '3');
 const MAX_ITEMS     = parseInt(process.env.MAX_ITEMS_PER_FEED  || '5');
+
+// ── [NEW v3.3] Live Fan Rooms ENV ───────────────────────────────────
+const APIFOOTBALL_KEY      = process.env.APIFOOTBALL_KEY;
+const LIVE_MATCHES_FETCH_MIN = parseInt(process.env.LIVE_MATCHES_FETCH_MIN || '5');
 
 if (!BOT_DB_URL) {
   console.error('❌ BOT_DATABASE_URL is required');
@@ -70,6 +77,15 @@ const newsMemCache = {
 // ═══════════════════════════════════════════
 const translationCache = new Map();
 const TRANSLATION_CACHE_MAX = 5000;
+
+// ═══════════════════════════════════════════
+// 🔴 [NEW v3.3] LIVE FAN ROOMS — IN-MEMORY CACHE
+// ═══════════════════════════════════════════
+const liveMatchesCache = {
+  matches: [],
+  updatedAt: 0,
+  isRefreshing: false
+};
 
 // ═══════════════════════════════════════════
 // 🤖 BOT PROFILE MAP
@@ -476,10 +492,61 @@ async function cleanup() {
 }
 
 // ═══════════════════════════════════════════
+// 🔴 [NEW v3.3] LIVE FAN ROOMS — REFRESH FROM APIFOOTBALL
+// ═══════════════════════════════════════════
+async function refreshLiveMatchesCache() {
+  if (!APIFOOTBALL_KEY) return;
+  if (liveMatchesCache.isRefreshing) return;
+  liveMatchesCache.isRefreshing = true;
+
+  const url = `https://apifootball.com/api/?action=get_events&match_live=1&APIkey=${APIFOOTBALL_KEY}`;
+
+  try {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 10000);
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(t);
+
+    if (!res.ok) {
+      console.error(`❌ APIFootball error: HTTP ${res.status}`);
+      return;
+    }
+
+    const raw  = await res.json();
+    const list = Array.isArray(raw) ? raw : [];
+
+    liveMatchesCache.matches = list.map(m => ({
+      match_id:             m.match_id,
+      match_hometeam_name:  m.match_hometeam_name,
+      match_awayteam_name:  m.match_awayteam_name,
+      match_hometeam_score: m.match_hometeam_score,
+      match_awayteam_score: m.match_awayteam_score,
+      team_home_badge:      m.team_home_badge,
+      team_away_badge:      m.team_away_badge,
+      match_status:         m.match_status,
+      match_time:           m.match_time,
+      league_name:          m.league_name
+    })).filter(m => m.match_id);
+
+    liveMatchesCache.updatedAt = Date.now();
+    console.log(`⚡ Live matches cache refreshed: ${liveMatchesCache.matches.length} match(es)`);
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      console.warn('⏱️ APIFootball timeout — کش قبلی حفظ شد');
+    } else {
+      console.error('❌ Live matches refresh error:', err.message);
+    }
+  } finally {
+    liveMatchesCache.isRefreshing = false;
+  }
+}
+
+// ═══════════════════════════════════════════
 // CRON JOBS
 // ═══════════════════════════════════════════
 cron.schedule(`*/${FETCH_MIN} * * * *`, runAllFeeds);
 cron.schedule('*/10 * * * *',          cleanup);
+cron.schedule(`*/${LIVE_MATCHES_FETCH_MIN} * * * *`, refreshLiveMatchesCache); // [NEW v3.3]
 
 // ═══════════════════════════════════════════
 // 🌐 [NEW] FREE TRANSLATION ENGINE (Google Translate Bypass)
@@ -704,6 +771,26 @@ app.get('/api/news/:newsId/comments', async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════
+// 🔴 [NEW v3.3] LIVE FAN ROOMS ENDPOINT
+// GET /live_matches.json
+// همان فایل کش‌شده‌ای که فرانت‌اند هر ۶۰ ثانیه می‌خواند
+// ═══════════════════════════════════════════
+app.get('/live_matches.json', (req, res) => {
+  res.set({
+    'Cache-Control': 'public, s-maxage=300, stale-while-revalidate=60',
+    'CDN-Cache-Control': 'public, max-age=300',
+    'Cloudflare-CDN-Cache-Control': 'public, max-age=300'
+  });
+
+  res.json({
+    success:    true,
+    count:      liveMatchesCache.matches.length,
+    matches:    liveMatchesCache.matches,
+    updated_at: liveMatchesCache.updatedAt ? new Date(liveMatchesCache.updatedAt).toISOString() : null
+  });
+});
+
 /** GET /health */
 app.get('/health', async (req, res) => {
   try {
@@ -719,6 +806,10 @@ app.get('/health', async (req, res) => {
       fetch_min:         FETCH_MIN,
       bots:              BOTS.length,
       translation_ready: true, // همیشه آماده است چون نیازی به کلید ندارد
+      // [NEW v3.3]
+      live_matches_cached:   liveMatchesCache.matches.length,
+      live_matches_age_s:    liveMatchesCache.updatedAt ? Math.floor((Date.now() - liveMatchesCache.updatedAt) / 1000) : null,
+      live_matches_ready:    !!APIFOOTBALL_KEY,
       ts:                new Date().toISOString()
     });
   } catch (e) {
@@ -728,14 +819,15 @@ app.get('/health', async (req, res) => {
 
 /** GET / */
 app.get('/', (req, res) => res.json({
-  service:   'AJ Sports RSS Bot v3.2 — Cached & Free Translate ⚡🌐',
+  service:   'AJ Sports RSS Bot v3.3 — Cached & Free Translate + Live Fan Rooms ⚡🌐🔴',
   endpoints: {
-    news:      '/api/news?lang=fa|en&limit=50',
-    translate: 'POST /api/translate  {text, target_lang}',
-    stats:     '/api/news/:newsId/stats',
-    likes:     'POST /api/news/:newsId/like',
-    comments:  'GET/POST /api/news/:newsId/comments',
-    health:    '/health'
+    news:          '/api/news?lang=fa|en&limit=50',
+    translate:     'POST /api/translate  {text, target_lang}',
+    stats:         '/api/news/:newsId/stats',
+    likes:         'POST /api/news/:newsId/like',
+    comments:      'GET/POST /api/news/:newsId/comments',
+    live_matches:  '/live_matches.json', // [NEW v3.3]
+    health:        '/health'
   },
   bots: BOTS.map(b => ({ name: b.name, display: b.display, feeds: b.feeds.length }))
 }));
@@ -745,11 +837,12 @@ app.get('/', (req, res) => res.json({
 // ═══════════════════════════════════════════
 async function start() {
   console.log('\n' + '═'.repeat(60));
-  console.log('🤖 AJ Sports RSS Bot v3.2 — Cached & FREE Translate ⚡🌐');
+  console.log('🤖 AJ Sports RSS Bot v3.3 — Cached & FREE Translate + Live Fan Rooms ⚡🌐🔴');
   console.log('═'.repeat(60));
   console.log(`📦 In-Memory Cache: ${newsMemCache.TTL_MS / 1000}s TTL`);
   console.log(`⏰ RSS Fetch every ${FETCH_MIN}min | News TTL ${NEWS_TTL_MIN}min`);
   console.log(`🌐 Translation API: ✅ Ready (100% Free - No API Key Needed)`);
+  console.log(`🔴 Live Fan Rooms: ${APIFOOTBALL_KEY ? '✅ Ready (every ' + LIVE_MATCHES_FETCH_MIN + 'min)' : '⚠️ APIFOOTBALL_KEY not set — disabled'}`);
   console.log('═'.repeat(60) + '\n');
 
   await initDB();
@@ -757,10 +850,12 @@ async function start() {
   app.listen(PORT, () => {
     console.log(`🚀 Bot server running on port ${PORT}`);
     console.log(`📡 News API:       http://localhost:${PORT}/api/news`);
-    console.log(`🌐 Translate API:  http://localhost:${PORT}/api/translate\n`);
+    console.log(`🌐 Translate API:  http://localhost:${PORT}/api/translate`);
+    console.log(`🔴 Live Matches:   http://localhost:${PORT}/live_matches.json\n`);
   });
 
   setTimeout(runAllFeeds, 6000);
+  if (APIFOOTBALL_KEY) setTimeout(refreshLiveMatchesCache, 8000); // [NEW v3.3]
   startKeepAlive();
 }
 
